@@ -1,0 +1,20 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
+// SPDX-License-Identifier: MIT
+
+#if {{ kDtypeKey }} == 1
+#define SPARSE_FWD_MIN_CTA_PER_CU 3
+#endif
+
+#include "sparse_fmha_fwd_entry.cuh"
+
+namespace minfer {
+namespace sparse {
+
+void {{ wrapper_name }}(SPARSE_FWD_ENTRY_PARAMS) {
+  sparse_fmha_fwd_forward<{{ kQpk }}, {{ kDtypeKey }}>(SPARSE_FWD_ENTRY_ARGS);
+}
+
+}
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ entry_name }}, minfer::sparse::{{ wrapper_name }});
