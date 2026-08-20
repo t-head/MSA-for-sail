@@ -45,9 +45,13 @@ _ARCH_FLAGS = {
 }
 
 
+def get_ppu_arch():
+    return os.environ.get("MINFER_PPU_ARCH") or _detect_ppu_arch()
+
+
 def _gencode_flag():
     """Return the device arch flag for the PPU generation in use."""
-    arch = os.environ.get("MINFER_PPU_ARCH") or _detect_ppu_arch()
+    arch = get_ppu_arch()
     try:
         return _ARCH_FLAGS[arch]
     except KeyError:
