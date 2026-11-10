@@ -323,10 +323,11 @@ _MAX_SPLIT_WORKSPACE_BYTES = 256 * 1024 * 1024  # 256 MB budget for split-KV wor
 _MAX_UNSPLIT = 4096  # must match MAX_UNSPLIT in plan.cuh
 # Hard bound: split sub_id is stored as int8_t in plan.cuh (task_sub_id), so max_splits must stay <= 128.
 _MAX_ADAPTIVE_SPLITS = 128
+_MAX_FIXED_SPARSE_SPLITS = 16
 
 def _plan_splits_and_sizes(is_sparse, qo_tile_size, num_ctas, n, ws_n,
                            total_qo_for_ws, pack_factor, num_qo_heads,
-                           num_kv_splits):
+                           num_kv_splits, sparse_kv_tiles=0, graph_safe=False):
     """Shared split-KV decision + workspace sizing for _fmha_sail_plan and
     allocate_graph_workspace. Single source of truth so the pre-allocated
     fixed-address workspace can never underestimate plan's requirement.
@@ -351,11 +352,17 @@ def _plan_splits_and_sizes(is_sparse, qo_tile_size, num_ctas, n, ws_n,
             total_tiles = (total_qo_for_ws + qo_tile_size - 1) // qo_tile_size * num_qo_heads
         max_capacity = num_ctas * 96  # num_ctas (actual SMs) * MAX_TASKS_PER_SM
         if total_tiles * 2 >= max_capacity or total_tiles >= _MAX_UNSPLIT:
-            # TODO: adaptive path in plan.cuh overflows near capacity; fix plan.cuh to support large workloads
-            # Also guard against MAX_UNSPLIT overflow in enumerate_unsplit_tiles.
-            # Workload too large for adaptive: use fixed nosplit (direct_greedy path)
-            effective_splits = 1
-            plan_kv_splits = 1
+            if graph_safe and is_sparse and sparse_kv_tiles > 1:
+                per_split_bytes = _compute_per_split_bytes(
+                    ws_n, num_ctas, total_qo_for_ws, num_qo_heads)
+                budget_splits = min(_MAX_ADAPTIVE_SPLITS,
+                                    max(1, _MAX_SPLIT_WORKSPACE_BYTES // per_split_bytes))
+                effective_splits = max(1, min(_MAX_FIXED_SPARSE_SPLITS,
+                                              sparse_kv_tiles, budget_splits))
+                plan_kv_splits = -effective_splits
+            else:
+                effective_splits = 1
+                plan_kv_splits = 1
         else:
             per_split_bytes = _compute_per_split_bytes(
                 ws_n, num_ctas, total_qo_for_ws, num_qo_heads)
@@ -443,7 +450,10 @@ def allocate_graph_workspace(batch_size, num_qo_heads, num_kv_heads=-1,
     # Sizing must match _fmha_sail_plan exactly; both use the shared helper.
     (_, _, _, _, _, _, total_bytes) = _plan_splits_and_sizes(
         is_sparse, qo_tile_size, num_ctas, n, max_total_q, total_qo_for_ws,
-        pack_factor, packed_heads, num_kv_splits)
+        pack_factor, packed_heads, num_kv_splits,
+        sparse_kv_tiles=(math.ceil(kv_block_num * page_size / kv_tile_size)
+                         if is_sparse else 0),
+        graph_safe=True)
     return torch.empty(total_bytes, dtype=torch.uint8, device=device)
 
 def _to_device(t, d):
@@ -1012,7 +1022,10 @@ def _fmha_sail_plan(
     (plan_kv_splits, effective_num_kv_splits, _explicit_nosplit, max_work_items,
      lse_total_size, workspace_o_elems, total_bytes) = _plan_splits_and_sizes(
         is_sparse, qo_tile_size, num_ctas, n, ws_n, total_qo_for_ws,
-        pack_factor, num_qo_heads, num_kv_splits)
+        pack_factor, num_qo_heads, num_kv_splits,
+        sparse_kv_tiles=(math.ceil(kv_block_num * page_size / kv_tile_size)
+                         if is_sparse else 0),
+        graph_safe=graph_safe)
 
     raw_ws = _get_plan_workspace_bytes(total_bytes, device, given_workspace)
     ws = slice_plan_workspace(raw_ws, ws_n, num_ctas, max_work_items,

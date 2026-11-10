@@ -526,6 +526,9 @@ __device__ void enumerate_unsplit_tiles(
   int qt_base = static_cast<int>(s.warp_scratch[0]) - 1;
   uint batch_base = 0;
   int uid = 0;
+  __syncthreads();
+  if (tid == 0) s.warp_scratch[1] = 0;
+  __syncthreads();
   while (qt_base >= 0 && uid < MAX_UNSPLIT) {
     uint batch_pos = batch_base + static_cast<uint>(tid);
     int qt = qt_base - static_cast<int>(batch_pos / static_cast<uint>(batch_size));
@@ -539,6 +542,7 @@ __device__ void enumerate_unsplit_tiles(
     cub::BlockScan<int, MAX_SMS>(s.scan_temp).ExclusiveSum(count, prefix, total);
     int begin = uid + prefix;
     int kept = ::min(count, ::max(0, MAX_UNSPLIT - begin));
+    if (kept < count) atomicOr(&s.warp_scratch[1], 1u);
     for (int h = 0; h < kept; h++) {
       s.unsplit_qo_tile[begin + h] = qt;
       s.unsplit_head[begin + h] = h;
@@ -552,6 +556,7 @@ __device__ void enumerate_unsplit_tiles(
     qt_base -= static_cast<int>(next_batch / static_cast<uint>(batch_size));
     batch_base = next_batch % static_cast<uint>(batch_size);
   }
+  if (qt_base >= 0) atomicOr(&s.warp_scratch[1], 1u);
   if (tid == 0) s.num_unsplit = uid;
 }
 
@@ -1041,6 +1046,22 @@ __global__ void plan_kernel(
                             qo_tile_size, kv_tile_size, batch_size, num_heads, causal,
                             pack_factor);
     __syncthreads();
+
+    if (state.warp_scratch[1] != 0u) {
+      int cost = direct_greedy(state, num_buckets,
+          qo_lens, kv_lens, qo_offsets, qo_tile_size, kv_tile_size,
+          batch_size, num_heads, causal, /*num_kv_splits=*/1, min_iters,
+          packed_work_range, packed_work_info,
+          kv_tile_begin_indices, kv_tile_end_indices, kv_split_indices,
+          num_kv_splits_per_row, qo_segment_offsets, pack_factor);
+      if (workspace_lse) init_workspace_lse(workspace_lse, lse_total_size);
+      if (threadIdx.x == 0 && out_max_sm_cost) {
+        out_max_sm_cost[0] = 0.f;
+        out_max_sm_cost[1] = 1.f;
+      }
+      (void)cost;
+      return;
+    }
 
     // Device-side adaptive min_iters, SPARSE-ONLY: coarsen split to page-level
     // (2 tiles of 64 = 1 page of 128 -> 16 splits) only for the tiniest
