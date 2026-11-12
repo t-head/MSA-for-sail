@@ -562,7 +562,9 @@ struct Softmax {
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
             float sum = row_sum(mi);
-            float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
+            // row_sum is a sum of exp2 values, so it is never negative;
+            const bool sum_ok = sum > 0.f;
+            float inv_sum = sum_ok ? 1.f / sum : 0.f;
             scores_scale(mi) = inv_sum * final_scale;
             if constexpr (Max_offset != 0) {
                 static constexpr float sum_scale = 1.f / float(1 << Max_offset);
@@ -573,7 +575,7 @@ struct Softmax {
             //     = (row_max * sm_scale + ln(sum)) / sm_scale = LSE_natural / sm_scale
             // The reduction kernel computes exp2f(scale_softmax_log2 * (lse_s - lse_r))
             // which gives exp(LSE_natural_s - LSE_natural_r) -- correct only with this format.
-            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) + __log2f(sum) / softmax_scale_log2;
+            row_sum(mi) = sum_ok ? row_max(mi) + __log2f(sum) / softmax_scale_log2 : -INFINITY;
         }
         return scores_scale;
     };

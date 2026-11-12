@@ -9,6 +9,7 @@ fmha_sail_plan and fmha_sail.
 Doc is REPO/docs/msa_for_sail_api.md
 """
 
+import logging
 import math
 from typing import Optional, Tuple, Union
 
@@ -22,7 +23,8 @@ import numpy as np
 import torch
 
 from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module, get_prepare_metadata_fn
-import os
+
+logger = logging.getLogger(__name__)
 
 _np_staging = np.empty(4096 * 1024, dtype=np.int32)
 _np_staging_offset = 0
@@ -453,20 +455,21 @@ def _prefill_qlen_threshold(sparse):
     return 32 if sparse else 128
 
 def _detect_paged_kv_layout(shape, page_size_hint):
+    # NHD [pages, ps, Hkv, D] is the default: dim1 == page_size means NHD.
     if len(shape) != 4:
         raise ValueError(
-            f"paged K/V must be 4D ([pages,Hkv,ps,D] HND or [pages,ps,Hkv,D] NHD), "
+            f"paged K/V must be 4D ([pages,ps,Hkv,D] NHD or [pages,Hkv,ps,D] HND), "
             f"got shape {tuple(shape)}")
     if page_size_hint is not None and page_size_hint > 0:
-        if shape[2] == page_size_hint:
-            return False, int(shape[1]), int(shape[2])      # HND
         if shape[1] == page_size_hint:
             return True, int(shape[2]), int(shape[1])       # NHD
+        if shape[2] == page_size_hint:
+            return False, int(shape[1]), int(shape[2])
         raise ValueError(
             f"cannot infer paged KV layout: neither dim1 nor dim2 of shape={tuple(shape)} "
-            f"equals page_size={page_size_hint}; expected [pages,Hkv,ps,D] (HND) "
-            f"or [pages,ps,Hkv,D] (NHD)")
-    return False, int(shape[1]), int(shape[2])
+            f"equals page_size={page_size_hint}; expected [pages,ps,Hkv,D] (NHD) "
+            f"or [pages,Hkv,ps,D] (HND)")
+    return True, int(shape[2]), int(shape[1])
 
 def _validate_fmha_inputs(
     q, k, v, qo_segment_lens, kv_segment_lens,
@@ -857,6 +860,7 @@ def _make_plan_info(
         "cute_workspace_buffer": cute_workspace_buffer,
         "graph_safe": graph_safe,
         "page_size": page_size,
+        "MM-SA-Nv":False
     })
 
 
@@ -916,8 +920,6 @@ def _fmha_sail_plan(
     if graph_safe:
         if max_qo_len_override <= 0:
             raise ValueError("graph_safe=True requires max_qo_len_override > 0")
-        if qo_len_uniform_override is None:
-            raise ValueError("graph_safe=True requires qo_len_uniform_override")
         if given_workspace is None:
             raise ValueError("graph_safe=True requires given_workspace (pre-allocated)")
         if max_total_q <= 0:
@@ -936,8 +938,16 @@ def _fmha_sail_plan(
                 "triggers an in-capture allocation")
         if isinstance(qo_offset, torch.Tensor) and not qo_offset.is_cuda:
             raise ValueError("graph_safe=True requires qo_offset tensor on CUDA")
+        # CSR-routed graph_safe (dev_plan.md Phase G) sizes everything from the
+        _csr_graph_route = kv_block_num > 0 and (
+            sparse_kernel_mode == 'prefill'
+            or (sparse_kernel_mode == 'auto'
+                and max_qo_len_override > _prefill_qlen_threshold(True)))
+        if not _csr_graph_route and qo_len_uniform_override is None:
+            raise ValueError("graph_safe=True requires qo_len_uniform_override")
         max_qo_len_orig = max_qo_len_override
-        qo_len_uniform = qo_len_uniform_override
+        qo_len_uniform = (qo_len_uniform_override
+                          if qo_len_uniform_override is not None else False)
         batch_size = qo_segment_lens.shape[0]
     else:
         qo_lens_list = qo_segment_lens.tolist()
@@ -950,6 +960,53 @@ def _fmha_sail_plan(
             assert qo_len_uniform_override == qo_len_uniform, (
                 f"qo_len_uniform_override={qo_len_uniform_override} != actual={qo_len_uniform}")
         batch_size = qo_segment_lens.shape[0]
+
+    # --- Sparse prefill routing (dev_plan.md Phase E) -----------------------
+    if kv_block_num > 0 and (sparse_kernel_mode == 'prefill' or (sparse_kernel_mode == 'auto' and max_qo_len_orig > _prefill_qlen_threshold(True))):
+        if qo_len_uniform_override is None:
+            if not graph_safe:
+                _ignored_legacy = []
+                if given_workspace is not None:
+                    _ignored_legacy.append("given_workspace")
+                if max_total_q > 0:
+                    _ignored_legacy.append("max_total_q")
+                if max_qo_len_override > 0:
+                    _ignored_legacy.append("max_qo_len_override")
+                if max_kv_len_override > 0:
+                    _ignored_legacy.append("max_kv_len_override")
+                if _ignored_legacy:
+                    logger.warning(
+                        "fmha_sail_plan: legacy-planner-only option(s) [%s] "
+                        "ignored on the CSR sparse route (graph_safe not set; "
+                        "the CSR planner sizes exactly from the actual segment "
+                        "lens and allocates its own buffers). Pass "
+                        "graph_safe=True to have them consumed as static graph "
+                        "bounds, or qo_len_uniform_override to keep the legacy "
+                        "planner.", ", ".join(_ignored_legacy))
+            from .sparse_fmha_adapter import sparse_fmha_plan as _sparse_fmha_plan
+            _sparse_qo_offset = qo_offset
+            if isinstance(_sparse_qo_offset, int):
+                _sparse_qo_offset = torch.full(
+                    (batch_size,), _sparse_qo_offset, dtype=torch.int32)
+            return _sparse_fmha_plan(
+                qo_segment_lens=qo_segment_lens,
+                kv_segment_lens=kv_segment_lens,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                qo_offset=_sparse_qo_offset,
+                page_size=page_size,
+                output_maxscore=output_maxscore,
+                kv_block_num=kv_block_num,
+                causal=causal,
+                usable_SM_count=usable_SM_count,
+                use_fp8_kvcache=use_fp8_kvcache,
+                graph_safe=graph_safe,
+                max_qo_len_override=max_qo_len_override,
+                max_kv_len_override=max_kv_len_override,
+                max_total_q=max_total_q,
+                given_workspace=given_workspace,
+                stream=stream,
+            )
 
     _new_ws_cache()
 
@@ -1218,6 +1275,75 @@ def _fmha_sail_plan(
 
 
 
+# ---------------------------------------------------------------------------
+
+
+def _sparse_api_execute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    plan_info,
+    kv_indices=None,
+    kv_block_indexes=None,
+    q_offset_override=None,
+    out=None,
+    max_score=None,
+    sm_scale=None,
+    q_scale=None,
+    k_scale=None,
+    v_scale=None,
+    o_scale=None,
+    output_maxscore: bool = True,
+    output_o: bool = True,
+    check_input_valid: bool = False,
+):
+    """Validate an api-layer sparse request and run it on the CSR backend.
+
+    Layering rules enforced here: q/k/v share one dtype, fp16 is not a
+    backward dtype. Per-tensor quantization scales are accepted but ignored
+    (GPU-backend parity, warned); only sm_scale applies.
+    """
+    if q.dtype != k.dtype:
+        raise ValueError(
+            "fmha_sail sparse mode requires q/k to share one dtype, "
+            f"got q={q.dtype}, k={k.dtype}."
+        )
+    if v.dtype != q.dtype:
+        raise ValueError(
+            "fmha_sail sparse mode requires q/k/v to share one dtype, "
+            f"got v={v.dtype} vs q={q.dtype}."
+        )
+    if q.dtype == torch.float16:
+        raise ValueError(
+            "fmha_sail sparse backend does not support fp16 inputs; "
+            "use bf16 or float8_e4m3fn."
+        )
+    _ignored_scales = [
+        f"{name}={float(val)}"
+        for name, val in (
+            ("q_scale", q_scale), ("k_scale", k_scale),
+            ("v_scale", v_scale), ("o_scale", o_scale),
+        )
+        if val is not None and float(val) != 1.0
+    ]
+    if _ignored_scales:
+        logger.warning(
+            "fmha_sail sparse (CSR): per-tensor scale(s) [%s] accepted but "
+            "ignored, matching the GPU backend (only sm_scale is applied; "
+            "quantization is the caller's responsibility).",
+            ", ".join(_ignored_scales))
+
+    from .sparse_fmha_adapter import sparse_fmha as _sparse_fmha
+
+    return _sparse_fmha(
+        q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score,
+        sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
+        o_scale=o_scale, kv_indices=kv_indices, output_maxscore=output_maxscore,
+        output_o=output_o, kv_block_indexes=kv_block_indexes,
+        q_offset_override=q_offset_override, check_input_valid=check_input_valid,
+    )
+
+
 def _fmha_sail(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1238,6 +1364,16 @@ def _fmha_sail(
     check_input_valid: bool = False,
     max_score_dtype: Optional[torch.dtype] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
+    if isinstance(plan_info, dict) and plan_info.get("MM-SA-Nv"):
+        return _sparse_api_execute(
+            q, k, v, plan_info, kv_indices=kv_indices,
+            kv_block_indexes=kv_block_indexes,
+            q_offset_override=q_offset_override, out=out, max_score=max_score,
+            sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale,
+            v_scale=v_scale, o_scale=o_scale, output_maxscore=output_maxscore,
+            output_o=output_o, check_input_valid=check_input_valid,
+        )
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
     if kv_indices is None:
